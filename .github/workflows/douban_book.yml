@@ -3,7 +3,8 @@ name: douban book sync
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 16 * * *"
+    - cron: "0 0 1,15 * *"
+      timezone: "Asia/Hong_Kong"
 permissions:
   contents: read
 concurrency:
