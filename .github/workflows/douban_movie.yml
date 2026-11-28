@@ -3,76 +3,131 @@ name: douban movie sync
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 16 * * *"
+    - cron: "0 0 1,15 * *"
+      timezone: "Asia/Hong_Kong"
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   sync:
-    name: Sync
+    name: Sync watched movies
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
-        NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-        MOVIE_NOTION_TOKEN: ${{ secrets.MOVIE_NOTION_TOKEN }}
-        NOTION_MOVIE_URL: ${{ secrets.NOTION_MOVIE_URL }}
-        DOUBAN_NAME: ${{ secrets.DOUBAN_NAME }}
-        AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
-        YEAR: ${{ vars.YEAR }}
-        REF: ${{ github.ref }}
-        REPOSITORY: ${{ github.repository }}
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      MOVIE_DATABASE_ID: ${{ secrets.MOVIE_DATABASE_ID }}
+      DOUBAN_NAME: ${{ secrets.DOUBAN_NAME }}
+      AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: 3.9
+          python-version: "3.9"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install .
-      - name: douban movie sync
+      - name: Sync watched movies only
         run: |
-          douban "movie"
-      - name: Remove folder
-        run: rm -rf ./OUT_FOLDER/movie
-      - name: Set default year if not provided
-        run: echo "YEAR=$(date +"%Y")" >> $GITHUB_ENV
-        if: env.YEAR == ''
-      - name: notion heatmap
-        run: |
-          github_heatmap notion  --notion_token "${{secrets.MOVIE_NOTION_TOKEN || secrets.NOTION_TOKEN}}" --database_id "${{ env.DATABASE_ID }}" --date_prop_name "日期" --value_prop_name "看过" --unit "部" --year $YEAR  --me "${{secrets.MOVIE_NAME}}" --without-type-name  --background-color=${{ vars.background_color||'#FFFFFF'}} --track-color=${{ vars.track_color||'#ACE7AE'}} --special-color1=${{ vars.special_color||'#69C16E'}} --special-color2=${{ vars.special_color2||'#549F57'}} --dom-color=${{ vars.dom_color||'#EBEDF0'}} --text-color=${{ vars.text_color||'#000000'}}
-      - name: udpate heatmap 
-        run: |
-            heatmap "movie"
-      - name: push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --global user.email "action@github.com"
-          git config --global user.name "GitHub Action"
-          ARTIFACT_BRANCH="heatmap-artifacts"
-          WORK_DIR="$(mktemp -d)"
-          REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-
-          if git ls-remote --exit-code --heads "$REPO_URL" "$ARTIFACT_BRANCH" >/dev/null 2>&1; then
-            git clone --depth 1 --branch "$ARTIFACT_BRANCH" "$REPO_URL" "$WORK_DIR/repo"
-          else
-            git clone --depth 1 "$REPO_URL" "$WORK_DIR/repo"
-            cd "$WORK_DIR/repo"
-            git checkout --orphan "$ARTIFACT_BRANCH"
-            git rm -rf . >/dev/null 2>&1 || true
-            cd - >/dev/null
-          fi
-
-          mkdir -p "$WORK_DIR/repo/OUT_FOLDER"
-          cp -R OUT_FOLDER/. "$WORK_DIR/repo/OUT_FOLDER/" 2>/dev/null || true
-
-          cd "$WORK_DIR/repo"
-          git add OUT_FOLDER
-          git commit -m 'update heatmap artifacts' || echo "nothing to commit"
-          git push origin "HEAD:$ARTIFACT_BRANCH" || echo "nothing to push"
+          python -u - <<'PY'
+          import os
+          from urllib.parse import urlsplit
+          from douban2notion.douban import fetch_subjects
+          from douban2notion.notion_helper import RateLimitedNotionClient
+          
+          def text(value):
+              value = str(value or "")
+              return [{"type": "text", "text": {"content": value[i:i+2000]}} for i in range(0, len(value), 2000)]
+          
+          def names(values):
+              return " / ".join(str(v.get("name") or "") if isinstance(v, dict) else str(v) for v in (values or []))
+          
+          def key(url):
+              parts = urlsplit(url or "")
+              return parts.netloc.lower(), parts.path.rstrip("/")
+          
+          def value(prop):
+              if not prop:
+                  return None
+              kind = prop.get("type")
+              if not kind:
+                  kind = next(iter(prop))
+              data = prop.get(kind)
+              if kind in ("title", "rich_text"):
+                  return "".join(t.get("plain_text", t.get("text", {}).get("content", "")) for t in (data or []))
+              if kind == "select":
+                  return data.get("name") if data else None
+              if kind == "date":
+                  return data.get("start") if data else None
+              if kind == "files":
+                  return [f.get("external", {}).get("url") or f.get("file", {}).get("url") for f in (data or [])]
+              return data
+          
+          def properties(item):
+              subject = item["subject"]
+              pic = subject.get("pic") or {}
+              cover = pic.get("large") or pic.get("normal")
+              return {
+                  "电影名": {"title": text(subject["title"])},
+                  "豆瓣": {"url": subject["url"]},
+                  "评分": {"number": (item.get("rating") or {}).get("value")},
+                  "状态": {"select": {"name": "看过"}},
+                  "日期": {"date": {"start": item["create_time"][:10]}},
+                  "短评": {"rich_text": text(item.get("comment"))},
+                  "封面": {"files": [{"name": "海报", "type": "external", "external": {"url": cover}}] if cover else []},
+                  "导演": {"rich_text": text(names(subject.get("directors")))},
+                  "演员": {"rich_text": text(names(subject.get("actors")))},
+                  "分类": {"rich_text": text(names(subject.get("genres")))},
+                  "类型": {"select": {"name": subject["type"]} if subject.get("type") else None},
+              }
+          
+          def main():
+              database_id = os.environ["MOVIE_DATABASE_ID"]
+              client = RateLimitedNotionClient(auth=os.environ["NOTION_TOKEN"])
+              existing = {}
+              cursor = None
+              while True:
+                  kwargs = {"database_id": database_id, "page_size": 100}
+                  if cursor:
+                      kwargs["start_cursor"] = cursor
+                  response = client.databases.query(**kwargs)
+                  for page in response["results"]:
+                      url = page["properties"].get("豆瓣", {}).get("url")
+                      if url:
+                          existing[key(url)] = page
+                  if not response.get("has_more"):
+                      break
+                  cursor = response["next_cursor"]
+              items = fetch_subjects(os.environ["DOUBAN_NAME"], "movie", "done")
+              created = updated = unchanged = 0
+              seen = set()
+              for item in items:
+                  if not item or item.get("status") != "done":
+                      raise ValueError("Unexpected non-watched record; sync stopped.")
+                  props = properties(item)
+                  item_key = key(item["subject"]["url"])
+                  if item_key in seen:
+                      continue
+                  seen.add(item_key)
+                  old = existing.get(item_key)
+                  if old:
+                      changed = {name: prop for name, prop in props.items() if value(old["properties"].get(name, {})) != value(prop)}
+                      if changed:
+                          client.pages.update(page_id=old["id"], properties=changed)
+                          updated += 1
+                      else:
+                          unchanged += 1
+                  else:
+                      client.pages.create(parent={"database_id": database_id}, properties=props)
+                      created += 1
+                  if len(seen) % 100 == 0:
+                      print(f"Processed {len(seen)} watched records", flush=True)
+              print(f"Watched movies: {len(seen)}; created: {created}; updated: {updated}; unchanged: {unchanged}", flush=True)
+          
+          main()
+          PY
